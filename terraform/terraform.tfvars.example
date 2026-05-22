@@ -1,0 +1,4 @@
+location          = "westeurope"
+project_name      = "az-alerting-poc"
+environment       = "poc"
+teams_webhook_url = "https://your-org.webhook.office.com/webhookb2/..."
