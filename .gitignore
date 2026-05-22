@@ -1,0 +1,25 @@
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+.terraform.lock.hcl
+
+# .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
+
+# Worktrees
+.worktrees/
+
+# Secrets
+*.pfx
+*.publishsettings
+
+# OS
+.DS_Store
+Thumbs.db
