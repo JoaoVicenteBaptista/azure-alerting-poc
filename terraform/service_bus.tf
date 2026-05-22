@@ -20,10 +20,3 @@ resource "azurerm_servicebus_queue" "main" {
   # Dead-lettering settings
   dead_lettering_on_message_expiration = true
 }
-
-# Grant Function App's managed identity Azure Service Bus Data Sender role
-resource "azurerm_role_assignment" "function_sb_sender" {
-  scope                = azurerm_servicebus_namespace.main.id
-  role_definition_name = "Azure Service Bus Data Sender"
-  principal_id         = azurerm_windows_function_app.main.identity[0].principal_id
-}
