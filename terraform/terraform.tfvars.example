@@ -1,0 +1,33 @@
+location          = "uksouth"
+project_name      = "az-alerting"
+environment       = "dev"
+teams_webhook_url = "https://your-org.webhook.office.com/webhookb2/..."
+
+# Out-of-band backup channel for alerts. Leave as [] to disable email.
+notification_emails = ["oncall@example.com"]
+
+# Business unit that owns this stack. Surfaces in tags and alert context.
+bu = "PLACEHOLDER"
+
+# Base URL for runbook links. Per-alert slugs are appended.
+runbook_base_url = "https://runbooks.example.com/azure-alerting"
+
+# Retention periods
+log_analytics_retention_days      = 30
+key_vault_soft_delete_retention_days = 7
+service_bus_message_ttl_days      = 7
+
+# Alert thresholds. Defaults below are dev-grade (looser). Tighten in uat
+# and prod. See README "Per-environment variable suggestions" for the
+# suggested values per environment.
+alert_thresholds = {
+  min_request_floor                = 5
+  failure_rate_pct                 = 10
+  timeout_rate_pct                 = 10
+  dependency_failure_rate_pct      = 10
+  p95_response_time_ms             = 3000
+  execution_spike_threshold        = 100
+  active_messages_threshold        = 10
+  send_failure_spike_count         = 5
+  dlq_growth_delta                 = 0
+}
