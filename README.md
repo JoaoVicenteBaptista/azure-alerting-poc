@@ -41,6 +41,7 @@ Intended as the mainline starting point for new Azure workloads — opinionated,
 - [Suggested improvements](#suggested-improvements)
   - [Alerting-pipeline watchdog](#alerting-pipeline-watchdog)
   - [SLO / burn-rate alerts](#slo--burn-rate-alerts)
+  - [Dynamic-baseline alerts for remaining static-threshold rules](#dynamic-baseline-alerts-for-remaining-static-threshold-rules)
   - [Alert-processing rules](#alert-processing-rules)
   - [Real runbook content](#real-runbook-content)
   - [Remote state backend](#remote-state-backend)
@@ -528,6 +529,82 @@ Option 3 is the minimum-viable improvement; Option 1 is the production-grade tar
 ### SLO / burn-rate alerts
 
 The current alerts use static-percentage thresholds (`> 5%` failure rate, etc.). A more mature setup defines an availability SLO (e.g., 99.9% over 30 days) and alerts on **error-budget burn rate** — for example, fire fast on 2% budget consumed in 1h, and slow on 5% consumed over 6h. The file layout (`alerts_function.tf`) supports adding these as a fourth tier without restructuring.
+
+### Dynamic-baseline alerts for remaining static-threshold rules
+
+Seven of the eleven alerts today use static thresholds — four KQL-based (failure rates, timeout rate, P95) and three metric-based (`aged_messages`, `dlq_growth`, `sb_throttling`). Static thresholds are simple to reason about but have a known weakness: they don't adapt to the workload's natural shape. A threshold of 100 `ActiveMessages` is noise for a queue that routinely sits at 80 but a crisis for one that sits at 2.
+
+Azure Monitor **dynamic thresholds** (`dynamic_criteria` on `azurerm_monitor_metric_alert`) replace a fixed number with a learned baseline computed from the last 6 hours, 1 day, or 1 week of the metric's history. The alert fires when the current value falls outside a configurable number of standard deviations from that baseline.
+
+#### How dynamic thresholds work
+
+1. **Learning period.** On first creation, Azure Monitor needs at least 3 days of data to establish a baseline. During this period the alert evaluates but does not fire (state = `Unknown`). Once 3 days of data exist, the baseline updates continuously as new data arrives — it is a rolling window, not a one-time snapshot.
+
+2. **Sensitivity.** Controls how tight the band around the baseline is:
+   - **Low** — wider band; fires only on extreme deviations. Fewer false positives but can miss genuine regressions.
+   - **Medium** — Azure's documented production recommendation. Balanced.
+   - **High** — narrow band; fires on modest deviations. High alert volume; documented by Azure as suitable for testing or low-severity signals.
+
+3. **Violations look-back.** Before firing, the alert checks how many recent evaluation windows violated the threshold. Default is 4 violations in the last 4 windows — a single spike does not page unless it persists.
+
+4. **Seasonality awareness.** The baseline automatically learns daily and weekly patterns (e.g., a batch queue that peaks at 02:00 UTC). No manual cron or time-window rules needed.
+
+#### Which alerts could benefit
+
+| Alert | Current signal | Dynamic-threshold fit | Rationale |
+|---|---|---|---|
+| `aged_messages` | Static `ActiveMessages > N` | **Strong** | Near-universal recommendation — queue depth naturally varies by workload and time of day. A static threshold either pages on normal peaks or fails to catch a genuine buildup. |
+| `execution_spike` | Static `count() > N` over 15m | **Strong** | Already uses KQL today because Flex Consumption metrics aren't available at deploy time, but once the function has run, the `requests/count` metric exists and can use a dynamic baseline. |
+| `sb_throttling` | Static `ThrottledRequests > 0` | **Weak** | Throttling is effectively binary — any throttle event is notable. A dynamic baseline adds complexity with no real benefit. Leave as static. |
+| `dlq_growth` | Static `DeadletteredMessages > 0` | **Weak** | Same as throttling — any DLQ entry is actionable. Dynamic baseline not useful. |
+
+KQL-based alerts (`function_failure_rate`, `function_timeout_rate`, `dependency_failure_rate`, `send_failure_spike`, `function_p95_response_time`, `execution_heartbeat`, `kv_access_failure`) **cannot use dynamic thresholds** — `dynamic_criteria` is exclusive to `azurerm_monitor_metric_alert`. These would stay as KQL with static thresholds unless replaced by equivalent metric-based alerts (which introduces the Flex Consumption cold-start problem noted in the design rationale).
+
+#### Cost impact
+
+Dynamic thresholds are charged per **time-series monitored**, same as static metric alerts. The per-rule cost is identical — £~0.08/month at 15m evaluation frequency. However, dynamic criteria multiply the time-series count when dimension splits are present:
+
+- `aged_messages` already splits on `EntityName`. If you have one queue, one time-series; if you have five queues, five time-series — same as the static version today.
+- `execution_spike` does not split on dimensions and would be one time-series.
+
+**No material cost increase** from converting these two alerts. The total monthly cost for 11 alerts would rise from ~£3.20 to ~£3.20 — the charge-per-time-series is the same whether it's static or dynamic.
+
+#### Implementation outline
+
+For `aged_messages`, replace the static `criteria` block:
+
+```hcl
+# Before (static)
+criteria {
+  metric_namespace = "Microsoft.ServiceBus/namespaces"
+  metric_name      = "ActiveMessages"
+  aggregation      = "Average"
+  operator         = "GreaterThan"
+  threshold        = var.alert_thresholds.active_messages_threshold
+}
+
+# After (dynamic)
+criteria {
+  metric_namespace = "Microsoft.ServiceBus/namespaces"
+  metric_name      = "ActiveMessages"
+  aggregation      = "Average"
+  operator         = "GreaterThan"
+  dynamic_criteria {
+    alert_sensitivity        = "Medium"
+    evaluation_total_count   = 4
+    evaluation_failure_count = 4
+    ignore_data_before       = null  # use all available history
+  }
+}
+```
+
+For `execution_spike`, first promote it from KQL to a metric alert (requires the function to have executed at least once so the metric namespace registers), then apply `dynamic_criteria` with `operator = "GreaterThan"`.
+
+#### Caveats
+
+- **Cold-start gap.** A brand-new resource with no history produces no alerts for 3 days. This is acceptable for most production workloads (the static-threshold version is unlikely to alert in the first 3 days anyway — no traffic, no violations) but worth noting for greenfield environments.
+- **Metric-only.** Dynamic thresholds are exclusively for platform metrics. KQL log-query alerts, Activity Log alerts, and Service Health alerts cannot use them. The four KQL rate-based alerts in this stack stay on static thresholds.
+- **Operator mental model.** A static threshold says "alert when X > 5." A dynamic threshold says "alert when X is unusually high." The latter is harder to trace during an incident — the operator cannot immediately see the threshold that was breached. Mitigate by including the baseline value in the alert description and linking to a Log Analytics query that plots the metric against its learned band.
 
 ### Alert-processing rules
 
