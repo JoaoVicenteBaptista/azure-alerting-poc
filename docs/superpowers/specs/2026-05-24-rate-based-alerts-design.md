@@ -38,6 +38,36 @@ The existing alerts work as a demo but are not safe to inherit into production:
 - Tuning thresholds against real traffic data. Initial values are first-principles; operators will adjust.
 - SLO-based alerting (burn-rate alerts on error budgets). Out of scope for this iteration but the file layout below makes it straightforward to add later.
 
+## Assumptions
+
+This design operates under the following assumptions. If any of these change, the design should be revisited.
+
+### Structured logging
+
+The function emits **structured logs** — every log entry has a consistent schema with named properties rather than relying on free-text message parsing. Concretely:
+
+- App Insights `traces` table entries carry `CorrelationId`, `BodySize`, `MessageId`, and `Source` as first-class custom dimensions, not as embedded fragments inside a `message` string.
+- KQL alerts query these dimensions directly (e.g., `| where customDimensions.Source == "az-alerting"`) rather than using `message contains` or regex extraction.
+- New log entries added in the future must follow the same pattern: add custom dimensions for any machine-actionable field; the `message` field is human-readable but is **not** relied on for alerting.
+
+This assumption is already true of the current code (`LogInformation` with structured placeholders + `LogError` with exception type capture) but is called out here because it underpins every KQL alert in this design. A move to unstructured logging (e.g., raw string interpolation into a single `message` string) would break every log-based alert silently.
+
+### Log data-plane is App Insights (not Log Analytics custom tables)
+
+All KQL alerts query App Insights tables (`requests`, `dependencies`, `exceptions`, `traces`). There is no assumption that the function writes to Log Analytics custom tables (`AzureDiagnostics` is only used for the Key Vault alert, which is the platform's own diagnostic data). If the function grows to emit custom log schemas directly to Log Analytics, alert queries need to move to the appropriate table.
+
+### Single-function, single-queue
+
+The alerting design assumes one HTTP-triggered function posting to one Service Bus queue. Adding a second function or a second queue requires: (a) new entity-level dimension filters on Service Bus metric alerts, and (b) new `cloud_RoleName` filters on function-side KQL alerts to prevent a noisy neighbour from masking the original function's metrics.
+
+### Callers are trusted (within a bounded context)
+
+The function does not validate or sanitize the request body beyond ensuring it is valid JSON. It assumes callers are known services within the same system. A public-facing or multi-tenant function would need:
+
+- Request body validation and size enforcement.
+- Rate limiting.
+- PII redaction before logging or telemetry (see README "Compliance and governance" for the current posture).
+
 ---
 
 ## Design

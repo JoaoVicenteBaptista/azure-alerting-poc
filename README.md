@@ -4,6 +4,48 @@ Production-grade Azure alerting baseline. Terraform-provisioned Function App + S
 
 Intended as the mainline starting point for new Azure workloads — opinionated, but every decision is documented and overridable.
 
+## Contents
+
+- [Architecture](#architecture)
+- [Quick Start](#quick-start)
+  - [Prerequisites](#prerequisites)
+  - [Infrastructure](#infrastructure)
+  - [Deploy the function](#deploy-the-function)
+  - [Run locally](#run-locally)
+  - [Trigger an alert](#trigger-an-alert)
+  - [Alert simulation modes](#alert-simulation-modes)
+  - [Full alert test suite](#full-alert-test-suite)
+- [Per-environment variable suggestions](#per-environment-variable-suggestions)
+  - [Alert threshold overrides](#alert-threshold-overrides)
+- [Resources Created](#resources-created)
+- [Alerts](#alerts)
+  - [Severity model](#severity-model)
+  - [Action groups](#action-groups)
+  - [Sev 1 — Critical](#sev-1--critical)
+  - [Sev 2 — Warning](#sev-2--warning)
+  - [Design rationale](#design-rationale)
+  - [Diagnostic settings](#diagnostic-settings)
+  - [Tagging](#tagging)
+  - [Known limitations](#known-limitations)
+- [Cost analysis](#cost-analysis)
+  - [Pricing model](#pricing-model)
+  - [Per-alert cost](#per-alert-cost)
+  - [Supporting infrastructure](#supporting-infrastructure)
+  - [Cost-reduction options](#cost-reduction-options)
+  - [Caveats](#caveats)
+- [Compliance and governance](#compliance-and-governance)
+  - [PII handling — what the stack collects](#pii-handling--what-the-stack-collects)
+  - [PII redaction strategy](#pii-redaction-strategy)
+  - [GDPR posture](#gdpr-posture)
+  - [Architecture governance — what's in place](#architecture-governance--whats-in-place)
+- [Suggested improvements](#suggested-improvements)
+  - [Alerting-pipeline watchdog](#alerting-pipeline-watchdog)
+  - [SLO / burn-rate alerts](#slo--burn-rate-alerts)
+  - [Alert-processing rules](#alert-processing-rules)
+  - [Real runbook content](#real-runbook-content)
+  - [Remote state backend](#remote-state-backend)
+- [Project Structure](#project-structure)
+
 ## Architecture
 
 - **Infrastructure as Code** — Terraform with local state and Key Vault secret management
@@ -399,6 +441,56 @@ The workload code is intentionally minimal in what it logs:
 - **Application Insights default telemetry** captures request URL (`/api/send`, no query string used), method, duration, response code, and client IP. App Insights IP masking is on by default in this configuration (last octet of IPv4 / last segment of IPv6 zeroed); we do not set `disable_ip_masking = true`.
 - **Custom dimensions** in App Insights from this code: `CorrelationId`, `BodySize`, `MessageId`, plus the `Source = "az-alerting"` application property. None are PII.
 - **Key Vault diagnostic setting** ships `AuditEvent`, which records each secret access with caller object ID, caller IP, and operation name. Caller IP here is GDPR-relevant for service-principal usage; partial masking is **not** applied to this category.
+
+### PII redaction strategy
+
+The current code avoids logging PII entirely — request bodies are never written to App Insights and the function emits only correlation IDs, byte counts, and generic error strings. This is a "log nothing sensitive" posture rather than a redaction-based one. If future work introduces logging that could carry PII (e.g., richer error context, request headers, or queue-dead-letter inspection), redaction should be applied at the **producer side** (inside the function) before data leaves the process — not post-hoc in Log Analytics.
+
+#### What to redact
+
+Any field whose purpose is to carry user-provided or identity-linked data:
+
+| Category | Examples | Default action |
+|---|---|---|
+| **Personally identifiable data** | Email addresses, phone numbers, national ID numbers, IP addresses (full), physical addresses | Replace with `<REDACTED>` or hash with a consistent salt |
+| **Credentials and secrets** | API keys, tokens, connection strings, `Authorization` headers | Replace with `<REDACTED>` — never hash; hashing secrets is reversible if the keyspace is known |
+| **Financial data** | Credit card numbers, bank account numbers, payment references | Replace with `<REDACTED>` or tokenize via a vault lookup |
+| **Request bodies with unknown schema** | Arbitrary JSON posted by callers | Pluck out known-safe top-level fields (e.g., correlation ID, trace context) and discard the rest; never log the full body |
+| **Exception data** | Exception messages re-echoing user input, stack traces with file paths from build machines | Use generic error strings; strip `StackTrace` or `InnerException.Message` if they could embed input values |
+
+#### Implementation approach
+
+Three layers, applied in order:
+
+1. **Structured logging guardrails.** The `ILogger` extension methods should only accept named parameters (`LogInformation("Processing {CorrelationId}", id)`) — never raw string interpolation (`$"Processing {id}"`). A Roslyn analyzer or lint rule can enforce this. This prevents accidental PII concatenation into the `message` field.
+
+2. **Redaction middleware / delegating handler.** A middleware layer in the HTTP pipeline (or a wrapper around `ILogger`) that:
+   - Hashes or replaces known PII patterns before they reach the log sink.
+   - Runs on a configurable allow-list of properties (e.g., `CorrelationId`, `BodySize`, `MessageId` — everything else is dropped or redacted by default, opt-in rather than opt-out).
+   - For ILogger calls, intercepts structured log-state values and redacts any key not on the allow-list.
+
+3. **Telemetry processor for App Insights.** An `ITelemetryProcessor` (or `ITelemetryInitializer` for enrichment) that:
+   - Sanitizes `RequestTelemetry.Properties` and `TraceTelemetry.Properties` to remove keys not on the allow-list.
+   - Strips `ExceptionTelemetry.Exception.StackTrace` unless an explicit opt-in flag is set.
+   - Masks the client IP in `RequestTelemetry` beyond the default last-octet masking if the jurisdiction requires it (App Insights defaults to partial masking; full masking sets `DisableIPMasking = true` in reverse — the property name is unfortunately double-negative; see [Microsoft docs](https://learn.microsoft.com/en-us/azure/azure-monitor/app/ip-collection)).
+
+#### Redaction at the workspace level (fallback)
+
+If producer-side redaction is not feasible in a given iteration (e.g., a third-party library emits PII), Log Analytics **workspace-level ingestion-time transformations** can scrub data after ingestion but before it is queryable. This is a last-resort safety net, not the primary strategy, because:
+
+- Transformations run on every row ingested and add latency + cost.
+- They are KQL-based and harder to test than in-code redaction.
+- They cannot retroactively redact data that was ingested before the transformation was deployed.
+
+For App Insights data specifically, ingestion-time transformations are **not supported** — App Insights tables bypass workspace-level transforms. PII in App Insights therefore must be caught before the SDK serializes it (layer 3 above).
+
+#### Verification
+
+Redaction coverage should be tested by:
+
+1. **Unit tests** that feed known-PII payloads through the redaction middleware and assert no PII reaches the log output.
+2. **Integration smoke tests** in a non-production environment that fire requests with synthetic PII patterns and query App Insights to confirm none appear in `traces`, `requests`, or `exceptions`.
+3. **Periodic audit queries** against the Log Analytics workspace scanning for known PII patterns (email regex, credit-card Luhn checks) — run as a scheduled notebook or a KQL alert with informational severity.
 
 ### GDPR posture
 
